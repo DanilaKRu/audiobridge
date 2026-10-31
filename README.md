@@ -77,10 +77,13 @@
 .\build\Release\audiobridge.exe
 ```
 
-### 3. Запуск с выбором конкретного устройства захвата Windows и ASIO
+### 3. Запуск с выбором конкретного устройства захвата Windows, ASIO и лимитом громкости
 ```powershell
-# Захват с устройства "MUCAI" или "PHASE" и вывод в TerraTec
-.\build\Release\audiobridge.exe --capture "MUCAI" --device "TerraTec" --buffer 256
+# Захват с CABLE Output, вывод в TerraTec с лимитом громкости 25%
+.\build\Release\audiobridge.exe --capture "CABLE Output" --device "TerraTec" --max-volume 0.25
+
+# Запуск в фоновом режиме (без окна консоли)
+.\build\Release\audiobridge.exe --capture "CABLE Output" --device "TerraTec" --max-volume 0.25 --headless
 ```
 
 ### 4. Справка по всем опциям
