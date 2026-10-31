@@ -96,6 +96,7 @@ std::atomic<bool> g_running{true};
 bool g_headless = false;
 std::atomic<float> g_systemVolumeScalar{1.0f};
 std::atomic<bool> g_systemMuted{false};
+std::atomic<float> g_maxVolume{1.0f};
 
 std::atomic<float> g_currentInPeak{0.0f};
 std::atomic<uint64_t> g_capturedPacketCount{0};
@@ -540,9 +541,6 @@ void wasapiCaptureThreadFunc(AudioRingBuffer* ringBuffer, const std::string& cap
 
             g_capturedPacketCount.fetch_add(1, std::memory_order_relaxed);
 
-            const float currentVol = g_systemMuted.load(std::memory_order_relaxed) ?
-                                     0.0f : g_systemVolumeScalar.load(std::memory_order_relaxed);
-
             stereoBuffer.resize(numFramesRead * 2);
 
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
@@ -552,8 +550,8 @@ void wasapiCaptureThreadFunc(AudioRingBuffer* ringBuffer, const std::string& cap
                 if (isFloatFormat) {
                     const float* floatIn = reinterpret_cast<const float*>(pData);
                     for (UINT32 f = 0; f < numFramesRead; ++f) {
-                        float left = floatIn[f * channels + 0] * currentVol;
-                        float right = (channels > 1) ? (floatIn[f * channels + 1] * currentVol) : left;
+                        float left = floatIn[f * channels + 0];
+                        float right = (channels > 1) ? floatIn[f * channels + 1] : left;
                         stereoBuffer[f * 2 + 0] = left;
                         stereoBuffer[f * 2 + 1] = right;
                     }
@@ -561,8 +559,8 @@ void wasapiCaptureThreadFunc(AudioRingBuffer* ringBuffer, const std::string& cap
                     const int16_t* intIn = reinterpret_cast<const int16_t*>(pData);
                     constexpr float scale16 = 1.0f / 32768.0f;
                     for (UINT32 f = 0; f < numFramesRead; ++f) {
-                        float left = (intIn[f * channels + 0] * scale16) * currentVol;
-                        float right = (channels > 1) ? ((intIn[f * channels + 1] * scale16) * currentVol) : left;
+                        float left = intIn[f * channels + 0] * scale16;
+                        float right = (channels > 1) ? (intIn[f * channels + 1] * scale16) : left;
                         stereoBuffer[f * 2 + 0] = left;
                         stereoBuffer[f * 2 + 1] = right;
                     }
@@ -570,8 +568,8 @@ void wasapiCaptureThreadFunc(AudioRingBuffer* ringBuffer, const std::string& cap
                     const int32_t* intIn = reinterpret_cast<const int32_t*>(pData);
                     constexpr float scale32 = 1.0f / 2147483648.0f;
                     for (UINT32 f = 0; f < numFramesRead; ++f) {
-                        float left = (intIn[f * channels + 0] * scale32) * currentVol;
-                        float right = (channels > 1) ? ((intIn[f * channels + 1] * scale32) * currentVol) : left;
+                        float left = intIn[f * channels + 0] * scale32;
+                        float right = (channels > 1) ? (intIn[f * channels + 1] * scale32) : left;
                         stereoBuffer[f * 2 + 0] = left;
                         stereoBuffer[f * 2 + 1] = right;
                     }
@@ -627,6 +625,8 @@ struct BridgeContext {
     RtAudioFormat streamFormat = RTAUDIO_SINT32;
     std::vector<float> tempFloatBuffer;
     std::atomic<float> currentOutPeak{0.0f};
+    float maxVolume = 1.0f;
+    float currentGain = 1.0f;
 };
 
 int asioPlaybackCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int nBufferFrames,
@@ -641,32 +641,63 @@ int asioPlaybackCallback(void* outputBuffer, void* /*inputBuffer*/, unsigned int
 
     const size_t samplesNeeded = static_cast<size_t>(nBufferFrames) * 2; // stereo
 
+    // Volume scalar (0.0f .. 1.0f) and mute status from Windows Core Audio
+    const float volumeScalar = g_systemVolumeScalar.load(std::memory_order_relaxed);
+    const bool isMuted = g_systemMuted.load(std::memory_order_relaxed);
+
+    // Calculate linear coefficient with maxVolume limit:
+    // float effectiveGain = isMuted ? 0.0f : (volumeScalar * maxVolume);
+    const float effectiveGain = isMuted ? 0.0f : (volumeScalar * ctx->maxVolume);
+
+    // Smooth linear interpolation across frames to eliminate zipper noise/clicks
+    const float startGain = ctx->currentGain;
+    const float endGain = effectiveGain;
+    const float gainStep = (nBufferFrames > 0) ? ((endGain - startGain) / static_cast<float>(nBufferFrames)) : 0.0f;
+
+    ctx->ringBuffer->read(ctx->tempFloatBuffer.data(), samplesNeeded);
+
+    float maxPeak = 0.0f;
+
     if (ctx->streamFormat == RTAUDIO_SINT32) {
         int32_t* outInt32 = static_cast<int32_t*>(outputBuffer);
 
-        ctx->ringBuffer->read(ctx->tempFloatBuffer.data(), samplesNeeded);
+        float currentFrameGain = startGain;
+        for (unsigned int f = 0; f < nBufferFrames; ++f) {
+            currentFrameGain += gainStep;
 
-        float maxPeak = 0.0f;
-        for (size_t i = 0; i < samplesNeeded; ++i) {
-            float s = ctx->tempFloatBuffer[i];
-            float absVal = std::abs(s);
-            if (absVal > maxPeak) maxPeak = absVal;
+            for (unsigned int ch = 0; ch < 2; ++ch) {
+                const size_t idx = static_cast<size_t>(f) * 2 + ch;
+                const float inSample = ctx->tempFloatBuffer[idx];
+                const float processed = inSample * currentFrameGain;
 
-            if (s > 1.0f) s = 1.0f;
-            else if (s < -1.0f) s = -1.0f;
+                const float absVal = std::abs(processed);
+                if (absVal > maxPeak) maxPeak = absVal;
 
-            outInt32[i] = static_cast<int32_t>(s * 2147483647.0f);
+                const int32_t outSample = static_cast<int32_t>(std::clamp(processed, -1.0f, 1.0f) * 2147483647.0f);
+                outInt32[idx] = outSample;
+            }
         }
+        ctx->currentGain = endGain;
         ctx->currentOutPeak.store(maxPeak, std::memory_order_relaxed);
     } else {
         float* outFloat = static_cast<float*>(outputBuffer);
-        ctx->ringBuffer->read(outFloat, samplesNeeded);
 
-        float maxPeak = 0.0f;
-        for (size_t i = 0; i < samplesNeeded; ++i) {
-            float absVal = std::abs(outFloat[i]);
-            if (absVal > maxPeak) maxPeak = absVal;
+        float currentFrameGain = startGain;
+        for (unsigned int f = 0; f < nBufferFrames; ++f) {
+            currentFrameGain += gainStep;
+
+            for (unsigned int ch = 0; ch < 2; ++ch) {
+                const size_t idx = static_cast<size_t>(f) * 2 + ch;
+                const float inSample = ctx->tempFloatBuffer[idx];
+                const float processed = inSample * currentFrameGain;
+
+                const float absVal = std::abs(processed);
+                if (absVal > maxPeak) maxPeak = absVal;
+
+                outFloat[idx] = std::clamp(processed, -1.0f, 1.0f);
+            }
         }
+        ctx->currentGain = endGain;
         ctx->currentOutPeak.store(maxPeak, std::memory_order_relaxed);
     }
 
@@ -700,12 +731,14 @@ void printUsage(const char* progName) {
               << "  -b, --buffer <samples>   ASIO buffer size (e.g. 256 or 512, default: 256)\n"
               << "  -ch, --channel <firstCh> First output channel index (default: 0 = Analog L, 1 = Analog R)\n"
               << "  -f, --format <fmt>       Output format: 'int32', 'float32', or 'auto' (default: 'auto')\n"
+              << "  -m, --max-volume <gain>  Maximum volume limit scalar 0.0 .. 1.0 (default: 1.0 = no limit)\n"
               << "  -s, --silent, --headless Run in background without console window / monitor output\n"
               << "  -l, --list               List available ASIO devices and exit\n"
               << "  --list-endpoints         List all Windows Playback (Render) and Recording (Capture) devices and exit\n"
               << "  -h, --help               Show this help message\n\n"
               << "Examples:\n"
               << "  " << progName << " --capture \"CABLE Output\" --device \"TerraTec\"\n"
+              << "  " << progName << " --capture \"CABLE Output\" --device \"TerraTec\" --max-volume 0.25\n"
               << "  " << progName << " --capture \"CABLE Output\" --device \"TerraTec\" --headless\n";
 }
 
@@ -811,6 +844,7 @@ int main(int argc, char* argv[]) {
     unsigned int bufferFrames = 256;
     unsigned int firstChannel = 0;
     std::string formatChoice = "auto";
+    float maxVolume = 1.0f;
 
     // Parse CLI arguments
     for (int i = 1; i < argc; ++i) {
@@ -836,12 +870,22 @@ int main(int argc, char* argv[]) {
             firstChannel = static_cast<unsigned int>(std::stoul(argv[++i]));
         } else if ((arg == "-f" || arg == "--format") && i + 1 < argc) {
             formatChoice = argv[++i];
+        } else if ((arg == "-m" || arg == "--max-volume" || arg == "--max-vol") && i + 1 < argc) {
+            try {
+                float val = std::stof(argv[++i]);
+                maxVolume = std::clamp(val, 0.0f, 1.0f);
+            } catch (const std::exception& e) {
+                std::cerr << "Invalid --max-volume value: " << argv[i] << " (" << e.what() << ")\n";
+                return 1;
+            }
         } else {
             std::cerr << "Unknown argument: " << arg << "\n";
             printUsage(argv[0]);
             return 1;
         }
     }
+
+    g_maxVolume.store(maxVolume, std::memory_order_relaxed);
 
     if (g_headless) {
         HWND hWnd = GetConsoleWindow();
@@ -859,6 +903,11 @@ int main(int argc, char* argv[]) {
     BridgeContext bridgeContext;
     bridgeContext.ringBuffer = &ringBuffer;
     bridgeContext.tempFloatBuffer.resize(16384, 0.0f);
+    bridgeContext.maxVolume = maxVolume;
+    bridgeContext.currentGain = g_systemMuted.load(std::memory_order_relaxed) ? 0.0f : (g_systemVolumeScalar.load(std::memory_order_relaxed) * maxVolume);
+
+    LOG_INFO << "[Volume Limit] Max volume ceiling: " << std::fixed << std::setprecision(0)
+             << (maxVolume * 100.0f) << "% (" << std::fixed << std::setprecision(2) << maxVolume << " scalar)\n";
 
     // Launch WASAPI Capture thread (direct eCapture or eRender loopback)
     std::thread wasapiThread(wasapiCaptureThreadFunc, &ringBuffer, capturePattern);
@@ -877,6 +926,8 @@ int main(int argc, char* argv[]) {
                 float inPeak = g_currentInPeak.load(std::memory_order_relaxed);
                 float outPeak = bridgeContext.currentOutPeak.load(std::memory_order_relaxed);
                 float vol = g_systemMuted.load(std::memory_order_relaxed) ? 0.0f : g_systemVolumeScalar.load(std::memory_order_relaxed);
+                float maxVol = g_maxVolume.load(std::memory_order_relaxed);
+                float effectiveVol = vol * maxVol;
                 size_t ringAvail = ringBuffer.availableRead();
 
                 uint64_t totalPkts = g_capturedPacketCount.load(std::memory_order_relaxed);
@@ -904,7 +955,7 @@ int main(int argc, char* argv[]) {
                 char lineBuf[96];
                 std::snprintf(lineBuf, sizeof(lineBuf),
                     "[Monitor] Vol:%3d%%%s | In:%4.2f | Out:%4.2f | Buf:%5zu | %s\r",
-                    static_cast<int>(vol * 100.0f),
+                    static_cast<int>(std::round(effectiveVol * 100.0f)),
                     (g_systemMuted.load(std::memory_order_relaxed) ? " [M]" : "    "),
                     inPeak, outPeak, ringAvail, stateMsg);
 

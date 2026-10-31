@@ -28,6 +28,9 @@ ARM64/
 *.ilk
 *.exp
 *.idb
+*.zip
+*.7z
+*.rar
 
 # CMake artifacts (if generated outside build/)
 CMakeFiles/
