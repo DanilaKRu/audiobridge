@@ -1,6 +1,6 @@
 # Windows 11 WASAPI Loopback → ASIO Audio Bridge (TerraTec FW / Phase)
 
-Высокопроизводительный, низколатентный системный аудиомост для Windows 11 на **C++20** с использованием **RtAudio 6.x**, **Steinberg ASIO SDK** и **Windows Core Audio API**.
+Высокопроизводительный системный аудиомост для Windows 11 на **C++20** с использованием **RtAudio 6.x**, **Steinberg ASIO SDK** и **Windows Core Audio API**.
 
 ---
 
