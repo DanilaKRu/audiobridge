@@ -1,0 +1,48 @@
+# Build directories
+build/
+out/
+bin/
+obj/
+x64/
+x86/
+ARM64/
+
+# Visual Studio / IDE files
+.vs/
+.vscode/
+*.vcxproj.user
+*.sln.docstates
+*.suo
+*.user
+*.userosscache
+*.sln.ide
+
+# Compiled binaries and object files
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# CMake artifacts (if generated outside build/)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Logs and crash dumps
+*.log
+task-*.log
+*.tlog
+*.dmp
+*.crash
+
+# OS-specific files
+Thumbs.db
+Desktop.ini
+.DS_Store
