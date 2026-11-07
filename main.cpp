@@ -887,6 +887,19 @@ int main(int argc, char* argv[]) {
 
     g_maxVolume.store(maxVolume, std::memory_order_relaxed);
 
+    // Prevent multiple instances running simultaneously (which causes severe comb filtering / phasing artifacts)
+    HANDLE hSingleInstanceMutex = CreateMutexW(nullptr, FALSE, L"Global\\TerraTecAudioBridgeSingleInstance");
+    if (!hSingleInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (!g_headless) {
+            std::cerr << "\n[Error] Another instance of AudioBridge is already running in the background!\n"
+                      << "Please terminate the existing instance before starting a new one to prevent audio phasing / conflicts.\n";
+        }
+        if (hSingleInstanceMutex) {
+            CloseHandle(hSingleInstanceMutex);
+        }
+        return 1;
+    }
+
     if (g_headless) {
         HWND hWnd = GetConsoleWindow();
         if (hWnd) {
@@ -1131,5 +1144,8 @@ int main(int argc, char* argv[]) {
     }
 
     LOG_INFO << "\n[System] AudioBridge stopped cleanly. Goodbye!\n";
+    if (hSingleInstanceMutex) {
+        CloseHandle(hSingleInstanceMutex);
+    }
     return 0;
 }
